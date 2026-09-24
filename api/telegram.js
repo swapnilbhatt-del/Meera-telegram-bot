@@ -1,10 +1,10 @@
 import { draftPost } from '../lib/gemini.js';
-import { sendMessage, sendTyping } from '../lib/telegram.js';
+import { sendMessage, sendTyping, webhookSecret } from '../lib/telegram.js';
 
 // Telegram webhook: POST /api/telegram
 export async function POST(request) {
-  const secret = process.env.TELEGRAM_WEBHOOK_SECRET;
-  if (!secret || request.headers.get('x-telegram-bot-api-secret-token') !== secret) {
+  // Telegram echoes back the secret that /api/setup registered, so fake requests are rejected.
+  if (request.headers.get('x-telegram-bot-api-secret-token') !== webhookSecret()) {
     return new Response('Unauthorized', { status: 401 });
   }
 
@@ -35,18 +35,9 @@ export function GET() {
 }
 
 async function handleMessage(chatId, message) {
+  // Optional lock: when ALLOWED_CHAT_ID is set, only that chat gets drafts.
   const allowed = process.env.ALLOWED_CHAT_ID;
-
-  // Setup mode: until ALLOWED_CHAT_ID is set, just tell whoever messages what their chat ID is.
-  if (!allowed) {
-    await sendMessage(
-      chatId,
-      `Your chat ID is ${chatId}.\n\nSet ALLOWED_CHAT_ID=${chatId} in Vercel and redeploy to start receiving drafts.`,
-    );
-    return;
-  }
-
-  if (String(chatId) !== String(allowed)) return;
+  if (allowed && String(chatId) !== String(allowed)) return;
 
   const text = message.text?.trim();
 
