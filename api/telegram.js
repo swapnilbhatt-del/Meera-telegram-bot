@@ -1,4 +1,5 @@
-import { draftPost, scoreNote, MIN_DRAFT_SCORE } from '../lib/gemini.js';
+import { draftPost, scoreNote, extractKeywords, MIN_DRAFT_SCORE } from '../lib/gemini.js';
+import { searchNews } from '../lib/news.js';
 import { sendMessage, sendTyping, webhookSecret } from '../lib/telegram.js';
 
 // Telegram webhook: POST /api/telegram
@@ -69,13 +70,38 @@ async function handleMessage(chatId, message) {
     return;
   }
 
-  const draft = await draftPost(text);
-  await sendMessage(chatId, `${draft}\n\n${scoreFooter(verdict)}`);
+  const news = await findNews(text);
+  const draft = await draftPost(text, news);
+  await sendMessage(chatId, `${draft.post}\n\n${scoreFooter(verdict)}\n\n${sourcesFooter(draft, news.length)}`);
+}
+
+// Note keywords -> Google News RSS. Best effort: any failure means drafting without news.
+async function findNews(note) {
+  const extracted = await extractKeywords(note);
+  if (!extracted) return [];
+  let news = await searchNews(extracted.query);
+  // A multi-word query can be too narrow; fall back to the two most specific keywords.
+  if (!news.length) news = await searchNews(extracted.keywords.slice(0, 2).join(' OR '));
+  console.log(`News for [${extracted.keywords.join(', ')}] via "${extracted.query}": ${news.length} headline(s)`);
+  return news;
 }
 
 // Appended to every draft so Meera can see how strong the note was.
 export function scoreFooter({ score, reason }) {
   return `———\nNote score: ${score}/10\n${reason}`;
+}
+
+// Listed after the score so Meera can check anything the draft took from Google News.
+export function sourcesFooter({ sources, confirmed }, newsCount) {
+  if (!newsCount) return 'Sources: none (no related Google News found)';
+  if (confirmed && !sources.length) return 'Sources: none (the related Google News headlines were not used)';
+  const heading = confirmed
+    ? 'Sources used from Google News:'
+    : "Google News headlines given to the draft (it didn't say which it used, so check all of them):";
+  const list = sources.map(
+    (n, i) => `${i + 1}. ${n.title} (${[n.source, n.published].filter(Boolean).join(', ') || 'unknown source'})\n${n.link}`,
+  );
+  return [heading, ...list].join('\n');
 }
 
 function ok() {
