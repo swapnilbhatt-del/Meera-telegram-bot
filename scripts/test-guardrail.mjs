@@ -10,6 +10,7 @@ const MOCK = process.argv.includes('--mock');
 if (MOCK) {
   process.env.GEMINI_API_KEY ||= 'mock';
   process.env.TELEGRAM_BOT_TOKEN ||= 'mock';
+  process.env.GEMINI_TIMEOUT_MS = '300'; // so "stuck request" tests run quickly
 }
 if (!process.env.GEMINI_API_KEY) {
   console.error('GEMINI_API_KEY is not set. Run with --env-file=.env, or use --mock.');
@@ -41,6 +42,7 @@ let cannedKeywords; // mock mode: raw keyword reply (default below)
 let feeds; // mock mode: RSS bodies (or Error) per news request, in order
 let cannedDraft; // mock mode: raw draft reply
 let rejectHtml = false; // mock mode: Telegram refuses HTML formatting
+let draftDelayMs = 0; // mock mode: slow drafting reply
 
 globalThis.fetch = async (url, init = {}) => {
   const u = String(url);
@@ -83,14 +85,30 @@ globalThis.fetch = async (url, init = {}) => {
       }
       return res;
     }
-    if (isDraft) return geminiText(cannedDraft);
+    if (isDraft) {
+      if (draftDelayMs) await new Promise((resolve) => setTimeout(resolve, draftDelayMs));
+      return geminiText(cannedDraft);
+    }
     const next = cannedScores.shift();
+    if (next?.hang) return hangUntilAborted(init.signal);
     if (next instanceof Error) return json({ error: { message: next.message } }, 500);
     if (next?.status) return json({ error: { message: 'This model is currently experiencing high demand.' } }, next.status);
     return geminiText(next ?? 'no more canned replies');
   }
   throw new Error(`Unexpected fetch to ${u}`);
 };
+
+// A Gemini request that never answers, until the bot's timeout aborts it.
+function hangUntilAborted(signal) {
+  return new Promise((_, reject) => {
+    // Like an open socket, keep the process alive while "waiting" (the abort timer alone doesn't).
+    const keepAlive = setInterval(() => {}, 1000);
+    signal?.addEventListener('abort', () => {
+      clearInterval(keepAlive);
+      reject(signal.reason);
+    });
+  });
+}
 
 function json(obj, status = 200) {
   return new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json' } });
@@ -99,7 +117,7 @@ function geminiText(text) {
   return json({ candidates: [{ content: { parts: [{ text }] }, finishReason: 'STOP' }] });
 }
 
-const { POST } = await import('../api/telegram.js');
+const { POST, pending } = await import('../api/telegram.js');
 const { webhookSecret } = await import('../lib/telegram.js');
 
 async function run(note) {
@@ -109,8 +127,12 @@ async function run(note) {
     headers: { 'x-telegram-bot-api-secret-token': webhookSecret(), 'Content-Type': 'application/json' },
     body: JSON.stringify({ message: { chat: { id: CHAT_ID }, text: note } }),
   });
+  const started = Date.now();
   const res = await POST(req);
-  return { status: res.status, ...log };
+  const answeredMs = Date.now() - started;
+  const repliesWhenAnswered = log.telegram.length;
+  await Promise.all(pending); // drafting continues in the background after Telegram gets its 200
+  return { status: res.status, answeredMs, repliesWhenAnswered, ...log };
 }
 
 const REJECT_PREFIX = "I didn't create a draft because this note isn't substantive enough yet: ";
@@ -137,6 +159,7 @@ async function caseRun(title, note, canned, expect, mock = {}) {
   feeds = [...(mock.feeds ?? [SAMPLE_FEED])];
   cannedDraft = mock.draft ?? 'Mock headline\n\nMOCK DRAFT\nUSED: 1';
   rejectHtml = mock.rejectHtml ?? false;
+  draftDelayMs = mock.draftDelayMs ?? 0;
   lastScoreLine = null;
   const r = await run(note);
   const score = lastScoreLine ? Number(lastScoreLine.match(/Note scored (\d+)/)[1]) : null;
@@ -269,6 +292,24 @@ if (MOCK) {
 
   const CDSCO_LINK = '<a href="https://news.google.com/rss/articles/BBB">CDSCO tightens cosmetic labelling &amp; testing rules</a> (Economic Times, 2026-09-23)';
   const HINDU_LINK = `<a href="https://news.google.com/rss/articles/AAA">Why your niacinamide serum's pH matters more than its percentage</a> (The Hindu, 2026-09-21)`;
+
+  await caseRun('Telegram is answered before a slow draft finishes', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
+    check('webhook answered quickly', r.status === 200 && r.answeredMs < 500, `${r.answeredMs}ms`);
+    check('draft not sent yet at that point', r.repliesWhenAnswered === 0);
+    check('draft delivered afterwards', r.telegram.length === 1 && r.telegram[0].includes('MOCK DRAFT'));
+  }, { draftDelayMs: 1500 });
+
+  const STUCK = { hang: true };
+  await caseRun('Stuck Gemini request: abandoned, backup model answers', TEST_A, [STUCK, '{"score": 8, "reason": "Specific."}'], (r, score) => {
+    check('moved to backup after timeout', r.scoreModels.join(',') === 'gemini-3.5-flash,gemini-3.5-flash-lite', r.scoreModels.join(' -> '));
+    check('scored and drafted', score === 8 && r.telegram[0]?.includes('MOCK DRAFT'));
+  });
+
+  await caseRun('Every Gemini request stuck: clear error, no draft', TEST_A, [STUCK, STUCK, STUCK, STUCK], (r) => {
+    check('tried 4 times', r.scoreCalls === 4);
+    check('drafting step NOT called', r.draftCalls.length === 0);
+    check('"did not respond in time" error sent', r.telegram[0]?.includes('Gemini did not respond in time'), r.telegram[0]?.slice(0, 90));
+  });
 
   await caseRun('Reply format: bold headline, post, score, linked sources', TEST_A, ['{"score": 7, "reason": "Specific and draftable."}'], (r) => {
     check('exact reply', r.telegram[0] === `<b>Mock headline</b>\n\nMOCK DRAFT\n\n———\nNote score: 7/10\nSpecific and draftable.\n\nSources used from Google News:\n1. ${CDSCO_LINK}`, JSON.stringify(r.telegram[0]));

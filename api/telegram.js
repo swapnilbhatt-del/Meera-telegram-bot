@@ -1,3 +1,4 @@
+import { waitUntil } from '@vercel/functions';
 import { draftPost, scoreNote, extractKeywords, MIN_DRAFT_SCORE } from '../lib/gemini.js';
 import { searchNews } from '../lib/news.js';
 import { sendMessage, sendTyping, webhookSecret, escapeHtml } from '../lib/telegram.js';
@@ -15,8 +16,20 @@ export async function POST(request) {
   // Ignore edits, channel posts, button callbacks, etc.
   if (!message) return ok();
 
-  const chatId = message.chat.id;
+  // Answer Telegram straight away and draft in the background: drafting can take longer than
+  // Telegram waits, and a timed-out webhook gets retried (duplicate drafts or none at all).
+  const work = processMessage(message.chat.id, message).finally(() => pending.delete(work));
+  pending.add(work);
+  waitUntil(work);
 
+  // Always 200 once authenticated, otherwise Telegram keeps retrying the same update.
+  return ok();
+}
+
+// Background drafts still running. Tests await these; on Vercel, waitUntil keeps them alive.
+export const pending = new Set();
+
+async function processMessage(chatId, message) {
   try {
     await handleMessage(chatId, message);
   } catch (err) {
@@ -25,9 +38,6 @@ export async function POST(request) {
       (sendErr) => console.error(sendErr),
     );
   }
-
-  // Always 200 once authenticated, otherwise Telegram keeps retrying the same update.
-  return ok();
 }
 
 // Lets you open the URL in a browser to confirm the deployment is live.

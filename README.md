@@ -9,7 +9,8 @@ Meera (Telegram) ──► Telegram ──► Vercel: /api/telegram ──► Ge
         └──────────── draft post ◄──────────┘
 ```
 
-No dependencies: it uses Node's built-in `fetch` for both the Telegram and Gemini APIs.
+It uses Node's built-in `fetch` for Telegram, Gemini and Google News. The only dependency is
+`@vercel/functions`, so the bot can answer Telegram at once and finish the draft in the background.
 
 ## Files
 
@@ -23,7 +24,7 @@ No dependencies: it uses Node's built-in `fetch` for both the Telegram and Gemin
 | `prompts/voice-skill.txt` | **Meera's voice profile.** Sent to Gemini with every note. |
 | `prompts/scoring-prompt.txt` | Strict 0–10 rubric. Every note is scored first; below 6 gets a short "no draft" reply instead of a draft. |
 | `scripts/test-guardrail.mjs` | Checks scoring, Google News, the backup model and the reply format. `node --env-file=.env scripts/test-guardrail.mjs` (live) or `--mock` (offline). |
-| `vercel.json` | Bundles `prompts/` with the function and allows up to 60s per request. |
+| `vercel.json` | Bundles `prompts/` with the function and gives each draft up to 5 minutes. |
 | `.env.example` | Every environment variable the project uses. |
 
 ## Setup
