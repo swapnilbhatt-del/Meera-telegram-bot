@@ -1,0 +1,225 @@
+// Runs notes through the real webhook handler (api/telegram.js) with Telegram stubbed out, and checks
+// the scoring guardrail routing. Nothing is sent to Telegram.
+//
+//   Live (real Gemini):  node --env-file=.env scripts/test-guardrail.mjs
+//   Offline (canned Gemini replies, incl. malformed JSON):  node scripts/test-guardrail.mjs --mock
+//
+// Nothing is sent to Telegram in either mode.
+
+const MOCK = process.argv.includes('--mock');
+if (MOCK) {
+  process.env.GEMINI_API_KEY ||= 'mock';
+  process.env.TELEGRAM_BOT_TOKEN ||= 'mock';
+}
+if (!process.env.GEMINI_API_KEY) {
+  console.error('GEMINI_API_KEY is not set. Run with --env-file=.env, or use --mock.');
+  process.exit(1);
+}
+
+const CHAT_ID = Number(process.env.ALLOWED_CHAT_ID) || 12345;
+const DRAFT_MARKER = 'You turn Meera';
+const KEYWORD_MARKER = 'Extract search keywords';
+
+// Mock Google News feed in the real RSS shape (title suffix, entities, source tag).
+const SAMPLE_FEED = `<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>"niacinamide pH" - Google News</title>
+<item><title>Why your niacinamide serum&#39;s pH matters more than its percentage - The Hindu</title><link>https://news.google.com/rss/articles/AAA</link><pubDate>Mon, 21 Sep 2026 06:00:00 GMT</pubDate><source url="https://www.thehindu.com">The Hindu</source></item>
+<item><title>CDSCO tightens cosmetic labelling &amp; testing rules - Economic Times</title><link>https://news.google.com/rss/articles/BBB</link><pubDate>Wed, 23 Sep 2026 09:30:00 GMT</pubDate><source url="https://economictimes.indiatimes.com">Economic Times</source></item>
+</channel></rss>`;
+const EMPTY_FEED = '<?xml version="1.0"?><rss version="2.0"><channel><title>x</title></channel></rss>';
+
+const TEST_A =
+  "I’ve noticed that customers often ask whether our niacinamide is 5% or 10%, but the percentage alone doesn't tell you much. The pH, delivery base and batch consistency can all affect what the finished product actually delivers. We should explain why concentration on the label is only the beginning of the question.";
+const TEST_B = 'Write something about niacinamide tomorrow.';
+const TEST_C = 'Need to write about climate and skincare formulations.';
+
+// --- fetch stub: record Telegram calls; send Gemini calls to the real API or to canned replies ---
+const realFetch = globalThis.fetch;
+let log;
+let cannedScores = []; // mock mode: raw scoring replies, consumed in order
+let cannedKeywords; // mock mode: raw keyword reply (default below)
+let feeds; // mock mode: RSS bodies (or Error) per news request, in order
+
+globalThis.fetch = async (url, init = {}) => {
+  const u = String(url);
+  if (u.startsWith('https://api.telegram.org')) {
+    const method = u.split('/').pop();
+    const body = JSON.parse(init.body);
+    if (method === 'sendMessage') log.telegram.push(body.text);
+    return json({ ok: true, result: true });
+  }
+  if (u.startsWith('https://news.google.com/rss/search')) {
+    log.newsQueries.push(new URL(u).searchParams.get('q'));
+    if (!MOCK) return realFetch(url, init);
+    const next = feeds.shift() ?? EMPTY_FEED;
+    if (next instanceof Error) throw next;
+    return new Response(next, { status: 200 });
+  }
+  if (u.includes('generativelanguage.googleapis.com')) {
+    const body = JSON.parse(init.body);
+    const sys = body.systemInstruction.parts[0].text;
+    if (sys.startsWith(KEYWORD_MARKER)) {
+      log.keywordCalls++;
+      if (!MOCK) return realFetch(url, init);
+      return geminiText(cannedKeywords);
+    }
+    const isDraft = sys.startsWith(DRAFT_MARKER);
+    if (isDraft) log.draftCalls.push(body);
+    else log.scoreCalls++;
+    if (!MOCK) {
+      const res = await realFetch(url, init);
+      if (!isDraft) {
+        const clone = await res.clone().json();
+        log.rawScores.push(clone.candidates?.[0]?.content?.parts?.[0]?.text);
+      }
+      return res;
+    }
+    if (isDraft) return geminiText('MOCK DRAFT');
+    const next = cannedScores.shift();
+    if (next instanceof Error) return json({ error: { message: next.message } }, 500);
+    if (next?.status) return json({ error: { message: 'This model is currently experiencing high demand.' } }, next.status);
+    return geminiText(next ?? 'no more canned replies');
+  }
+  throw new Error(`Unexpected fetch to ${u}`);
+};
+
+function json(obj, status = 200) {
+  return new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json' } });
+}
+function geminiText(text) {
+  return json({ candidates: [{ content: { parts: [{ text }] }, finishReason: 'STOP' }] });
+}
+
+const { POST } = await import('../api/telegram.js');
+const { webhookSecret } = await import('../lib/telegram.js');
+
+async function run(note) {
+  log = { telegram: [], draftCalls: [], scoreCalls: 0, rawScores: [], keywordCalls: 0, newsQueries: [] };
+  const req = new Request('https://example.test/api/telegram', {
+    method: 'POST',
+    headers: { 'x-telegram-bot-api-secret-token': webhookSecret(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: { chat: { id: CHAT_ID }, text: note } }),
+  });
+  const res = await POST(req);
+  return { status: res.status, ...log };
+}
+
+const REJECT_PREFIX = "I didn't create a draft because this note isn't substantive enough yet: ";
+let failures = 0;
+function check(name, cond, detail) {
+  console.log(`  ${cond ? 'PASS' : 'FAIL'}  ${name}${detail ? ` (${detail})` : ''}`);
+  if (!cond) failures++;
+}
+
+// Capture the handler's "Note scored X/10" log line.
+const realLog = console.log;
+let lastScoreLine = null;
+console.log = (...args) => {
+  const line = args.join(' ');
+  if (line.startsWith('Note scored ')) lastScoreLine = line;
+  else if (line.startsWith('News for ')) realLog(`  ${line}`);
+  else realLog(...args);
+};
+
+async function caseRun(title, note, canned, expect, mock = {}) {
+  realLog(`\n${title}`);
+  cannedScores = canned ?? [];
+  cannedKeywords = mock.keywords ?? '{"keywords": ["niacinamide", "pH", "batch consistency", "CoA"], "query": "niacinamide pH"}';
+  feeds = [...(mock.feeds ?? [SAMPLE_FEED])];
+  lastScoreLine = null;
+  const r = await run(note);
+  const score = lastScoreLine ? Number(lastScoreLine.match(/Note scored (\d+)/)[1]) : null;
+  realLog(`  score line: ${lastScoreLine ?? '(none)'}`);
+  if (r.rawScores.length) realLog(`  raw Gemini scoring reply: ${r.rawScores.join(' | ')}`);
+  if (r.newsQueries.length) realLog(`  news queries: ${JSON.stringify(r.newsQueries)}`);
+  if (r.draftCalls[0]) realLog(`  news in draft request: ${r.draftCalls[0].contents[0].parts[0].text.includes('Recent Google News headlines') ? 'yes' : 'no'}`);
+  realLog(`  telegram replies: ${JSON.stringify(r.telegram.map((t) => t.slice(0, 160)))}`);
+  expect(r, score);
+}
+
+await caseRun('TEST A: substantive note', TEST_A, ['{"score": 8, "reason": "The note makes a specific argument about why label concentration is incomplete, naming pH, delivery base and batch consistency."}'], (r, score) => {
+  check('score >= 6', score !== null && score >= 6, `score=${score}`);
+  check('drafting step called once', r.draftCalls.length === 1);
+  check('draft sent to Telegram', r.telegram.length === 1 && !r.telegram[0].startsWith("I didn't create"));
+});
+
+await caseRun('TEST B: task/reminder', TEST_B, ['{"score": 2, "reason": "The note is a reminder to write about a topic and contains no actual idea or content."}'], (r, score) => {
+  check('score <= 3', score !== null && score <= 3, `score=${score}`);
+  check('drafting step NOT called', r.draftCalls.length === 0);
+  check('no keyword or news lookup', r.keywordCalls === 0 && r.newsQueries.length === 0);
+  check('rejection message sent', r.telegram.length === 1 && r.telegram[0].startsWith(REJECT_PREFIX));
+});
+
+await caseRun('TEST C: topic / general thought', TEST_C, ['{"score": 3, "reason": "The note names a topic but gives no observation, argument or detail to draft from."}'], (r, score) => {
+  check('score < 6', score !== null && score < 6, `score=${score}`);
+  check('drafting step NOT called', r.draftCalls.length === 0);
+  check('no keyword or news lookup', r.keywordCalls === 0 && r.newsQueries.length === 0);
+  check('rejection message sent', r.telegram.length === 1 && r.telegram[0].startsWith(REJECT_PREFIX));
+});
+
+if (MOCK) {
+  const FAIL_CLOSED = "I didn't create a draft because I couldn't score this note. Please send it again.";
+  const malformed = [
+    ['not JSON at all, twice', ['Sure! This note is great, 9/10.', 'Score: 9']],
+    ['score as string "9", twice', ['{"score": "9", "reason": "x."}', '{"score": "9", "reason": "x."}']],
+    ['non-integer score 6.5, twice', ['{"score": 6.5, "reason": "x."}', '{"score": 6.5, "reason": "x."}']],
+    ['out of range 11, twice', ['{"score": 11, "reason": "x."}', '{"score": 11, "reason": "x."}']],
+    ['extra field, twice', ['{"score": 9, "reason": "x.", "draft": "..."}', '{"score": 9, "reason": "x.", "draft": "..."}']],
+    ['missing reason, twice', ['{"score": 9}', '{"score": 9}']],
+  ];
+  for (const [label, canned] of malformed) {
+    await caseRun(`MALFORMED: ${label}`, TEST_A, canned, (r) => {
+      check('drafting step NOT called', r.draftCalls.length === 0);
+      check('fail-closed message sent', r.telegram.length === 1 && r.telegram[0] === FAIL_CLOSED);
+    });
+  }
+
+  await caseRun('MALFORMED then valid on retry', TEST_A, ['oops', '{"score": 7, "reason": "Specific and draftable."}'], (r, score) => {
+    check('retried once', r.scoreCalls === 2);
+    check('score 7 routes to drafting', score === 7 && r.draftCalls.length === 1);
+  });
+
+  await caseRun('Fenced JSON is accepted', TEST_A, ['```json\n{"score": 7, "reason": "Specific and draftable."}\n```'], (r, score) => {
+    check('score parsed', score === 7 && r.draftCalls.length === 1);
+  });
+
+  await caseRun('Boundary: score exactly 6 drafts', TEST_A, ['{"score": 6, "reason": "Minimum substance present."}'], (r) => {
+    check('drafting step called', r.draftCalls.length === 1);
+  });
+
+  await caseRun('Boundary: score 5 rejects', TEST_A, ['{"score": 5, "reason": "Underdeveloped."}'], (r) => {
+    check('drafting step NOT called', r.draftCalls.length === 0);
+    check('rejection text has reason', r.telegram[0] === `${REJECT_PREFIX}Underdeveloped.`);
+  });
+
+  // An empty reply throws in the shared Gemini call, so it lands in the existing error handler.
+  await caseRun('Empty scoring reply', TEST_A, [''], (r) => {
+    check('drafting step NOT called', r.draftCalls.length === 0);
+    check('existing error reply sent', r.telegram[0]?.startsWith('Sorry, something went wrong'));
+  });
+
+  await caseRun('Gemini API error during scoring', TEST_A, [new Error('quota exceeded')], (r) => {
+    check('drafting step NOT called', r.draftCalls.length === 0);
+    check('existing error reply sent', r.telegram[0]?.startsWith('Sorry, something went wrong'));
+  });
+
+  const OVERLOADED = { status: 503 };
+  await caseRun('Gemini overloaded (503) once, then answers', TEST_A, [OVERLOADED, '{"score": 8, "reason": "Specific."}'], (r, score) => {
+    check('retried after 503 and scored', r.scoreCalls === 2 && score === 8);
+    check('draft sent', r.draftCalls.length === 1 && r.telegram[0] === 'MOCK DRAFT');
+  });
+
+  await caseRun('Gemini overloaded (503) on every try', TEST_A, [OVERLOADED, OVERLOADED, OVERLOADED], (r) => {
+    check('gave up after 3 tries', r.scoreCalls === 3);
+    check('drafting step NOT called', r.draftCalls.length === 0);
+    check('existing error reply sent', r.telegram[0]?.startsWith('Sorry, something went wrong'));
+  });
+
+  await caseRun('Drafting request is exactly the note', TEST_A, ['{"score": 9, "reason": "Strong."}'], (r) => {
+    const body = r.draftCalls[0];
+    check('only systemInstruction + contents keys (no generationConfig)', body && Object.keys(body).join(',') === 'systemInstruction,contents');
+    check('note passed through verbatim', body?.contents[0].parts[0].text === TEST_A);
+  });
+}
+
+realLog(`\n${failures === 0 ? 'ALL CHECKS PASSED' : `${failures} CHECK(S) FAILED`}`);
+process.exit(failures ? 1 : 0);

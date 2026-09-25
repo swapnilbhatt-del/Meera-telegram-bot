@@ -15,11 +15,13 @@ No dependencies: it uses Node's built-in `fetch` for both the Telegram and Gemin
 
 | File | What it does |
 | --- | --- |
-| `api/telegram.js` | The webhook Telegram calls for every message. Checks the request is from Telegram, gets a draft, replies. |
+| `api/telegram.js` | The webhook Telegram calls for every message. Checks the request is from Telegram, scores the note, drafts it only if it scores 6 or more, replies. |
 | `api/setup.js` | Open once in a browser to connect Telegram to the deployment. |
 | `lib/gemini.js` | Sends the note to Gemini with `prompts/voice-skill.txt` as the system instruction. |
 | `lib/telegram.js` | Sends replies (split into 4096-char chunks) and the "typing…" indicator. |
 | `prompts/voice-skill.txt` | **Meera's voice profile.** Sent to Gemini with every note. |
+| `prompts/scoring-prompt.txt` | Strict 0–10 rubric. Every note is scored first; below 6 gets a short "no draft" reply instead of a draft. |
+| `scripts/test-guardrail.mjs` | Checks the scoring guardrail. `node --env-file=.env scripts/test-guardrail.mjs` (live) or `--mock` (offline). |
 | `vercel.json` | Bundles `prompts/` with the function and allows up to 60s per request. |
 | `.env.example` | Every environment variable the project uses. |
 

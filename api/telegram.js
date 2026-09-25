@@ -1,4 +1,4 @@
-import { draftPost } from '../lib/gemini.js';
+import { draftPost, scoreNote, MIN_DRAFT_SCORE } from '../lib/gemini.js';
 import { sendMessage, sendTyping, webhookSecret } from '../lib/telegram.js';
 
 // Telegram webhook: POST /api/telegram
@@ -52,6 +52,23 @@ async function handleMessage(chatId, message) {
   }
 
   await sendTyping(chatId).catch(() => {});
+
+  // Guardrail: score the note first; only notes scoring MIN_DRAFT_SCORE or higher get drafted.
+  const verdict = await scoreNote(text);
+  if (!verdict) {
+    // Fail closed: an unreadable score never lets a note through.
+    await sendMessage(chatId, "I didn't create a draft because I couldn't score this note. Please send it again.");
+    return;
+  }
+  console.log(`Note scored ${verdict.score}/10: ${verdict.reason}`);
+  if (verdict.score < MIN_DRAFT_SCORE) {
+    await sendMessage(
+      chatId,
+      `I didn't create a draft because this note isn't substantive enough yet: ${verdict.reason}`,
+    );
+    return;
+  }
+
   const draft = await draftPost(text);
   await sendMessage(chatId, draft);
 }
