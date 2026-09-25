@@ -401,7 +401,7 @@ if (MOCK) {
 
   await caseRun('Gemini used none anyway: related news still linked', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
     const reply = r.telegram[0];
-    check('related news listed with links', reply.includes(`Related Google News (not used in the post):\n1. ${CDSCO_LINK}\n2. ${HINDU_LINK}`));
+    check('related news listed with links', reply.includes(`Related Google News:\n1. ${CDSCO_LINK}\n2. ${HINDU_LINK}`));
     check('marker removed', !reply.includes('USED'));
   }, { draft: 'Title\n\nPost body.\nUSED: none' });
 

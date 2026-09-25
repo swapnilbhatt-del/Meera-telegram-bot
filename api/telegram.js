@@ -138,7 +138,7 @@ export function sourcesFooter({ sources, confirmed }, news) {
   if (!confirmed) {
     heading = "Google News headlines given to the draft (it didn't say which it used, so check all of them):";
   } else if (!sources.length) {
-    heading = 'Related Google News (not used in the post):';
+    heading = 'Related Google News:';
     list = news;
   }
   const items = list.map((n, i) => {
