@@ -129,23 +129,19 @@ export function scoreFooter({ score, reason }) {
   return `———\nNote score: ${score}/10\n${reason}`;
 }
 
+const SOURCES_HEADING = 'Related Google News used in the content formation:';
+
 // Listed after the score so Meera can check anything the draft took from Google News.
 // Returns HTML: each headline links to its Google News article.
 export function sourcesFooter({ sources, confirmed }, news) {
   if (!news.length) return 'Sources: none (no related Google News found)';
-  let heading = 'Sources used from Google News:';
-  let list = sources;
-  if (!confirmed) {
-    heading = "Google News headlines given to the draft (it didn't say which it used, so check all of them):";
-  } else if (!sources.length) {
-    heading = 'Related Google News:';
-    list = news;
-  }
+  // The headlines Gemini says it used; if it named none (or didn't say), every headline it was given.
+  const list = confirmed && sources.length ? sources : news;
   const items = list.map((n, i) => {
     const meta = [n.source, n.published].filter(Boolean).join(', ') || 'unknown source';
     return `${i + 1}. <a href="${escapeHtml(n.link)}">${escapeHtml(n.title)}</a> (${escapeHtml(meta)})`;
   });
-  return [heading, ...items].join('\n');
+  return [SOURCES_HEADING, ...items].join('\n');
 }
 
 function ok() {

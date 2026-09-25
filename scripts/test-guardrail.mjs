@@ -184,7 +184,7 @@ await caseRun('TEST A: substantive note', TEST_A, ['{"score": 8, "reason": "The 
   const reply = r.telegram.join('');
   check('starts with a bold headline', /^<b>[^<\n]{3,150}<\/b>\n\n\S/.test(reply), reply.split('\n')[0].slice(0, 90));
   check('sent with HTML formatting', r.parseModes.every((m) => m === 'HTML'));
-  check('sources listed after the score', /Note score: [\s\S]*\n\n(Sources used from Google News:|Related Google News|Google News headlines given)/.test(reply));
+  check('sources listed after the score', /Note score: [\s\S]*\n\nRelated Google News used in the content formation:\n1\. <a href/.test(reply));
   check('reply has a Google News link', reply.includes('<a href="https://news.google.com/'));
   check('no USED: marker left in the post', !/^USED:/im.test(reply));
   const post = reply.split('———')[0];
@@ -312,7 +312,7 @@ if (MOCK) {
   });
 
   await caseRun('Reply format: bold headline, post, score, linked sources', TEST_A, ['{"score": 7, "reason": "Specific and draftable."}'], (r) => {
-    check('exact reply', r.telegram[0] === `<b>Mock headline</b>\n\nMOCK DRAFT\n\n———\nNote score: 7/10\nSpecific and draftable.\n\nSources used from Google News:\n1. ${CDSCO_LINK}`, JSON.stringify(r.telegram[0]));
+    check('exact reply', r.telegram[0] === `<b>Mock headline</b>\n\nMOCK DRAFT\n\n———\nNote score: 7/10\nSpecific and draftable.\n\nRelated Google News used in the content formation:\n1. ${CDSCO_LINK}`, JSON.stringify(r.telegram[0]));
     check('sent as HTML', r.parseModes[0] === 'HTML');
     check('score not sent to Gemini for drafting', !r.draftCalls[0].contents[0].parts[0].text.includes('Note score'));
   });
@@ -358,7 +358,7 @@ if (MOCK) {
 
   await caseRun('Second search (either keyword) finds news', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
     check('stopped after 2 searches', r.newsQueries.length === 2);
-    check('source linked', r.telegram[0].includes(`Sources used from Google News:\n1. ${CDSCO_LINK}`));
+    check('source linked', r.telegram[0].includes(`Related Google News used in the content formation:\n1. ${CDSCO_LINK}`));
   }, { feeds: [EMPTY_FEED, SAMPLE_FEED] });
 
   await caseRun('Third search (single keyword) finds news', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
@@ -389,7 +389,7 @@ if (MOCK) {
 
   await caseRun('Gemini used headline 2 only', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
     const reply = r.telegram[0];
-    check('only headline 2 listed, linked', reply.includes(`1. ${HINDU_LINK}`) && !reply.includes('CDSCO'));
+    check('only headline 2 listed, linked', reply.includes(`Related Google News used in the content formation:\n1. ${HINDU_LINK}`) && !reply.includes('CDSCO'));
     check('USED line removed from post', reply.startsWith('<b>Title</b>\n\nPost body.\n\n———'));
   }, { draft: 'Title\n\nPost body.\nUSED: 2' });
 
@@ -401,7 +401,7 @@ if (MOCK) {
 
   await caseRun('Gemini used none anyway: related news still linked', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
     const reply = r.telegram[0];
-    check('related news listed with links', reply.includes(`Related Google News:\n1. ${CDSCO_LINK}\n2. ${HINDU_LINK}`));
+    check('related news listed with links', reply.includes(`Related Google News used in the content formation:\n1. ${CDSCO_LINK}\n2. ${HINDU_LINK}`));
     check('marker removed', !reply.includes('USED'));
   }, { draft: 'Title\n\nPost body.\nUSED: none' });
 
@@ -412,7 +412,7 @@ if (MOCK) {
   await caseRun('Gemini forgot the USED line', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
     const reply = r.telegram[0];
     check('post kept whole', reply.startsWith('<b>Title</b>\n\nPost body without marker.\n\n———'));
-    check('all headlines linked with a check-them warning', reply.includes("didn't say which it used") && reply.includes(CDSCO_LINK) && reply.includes(HINDU_LINK));
+    check('all headlines listed under the same heading', reply.includes(`Related Google News used in the content formation:\n1. ${CDSCO_LINK}\n2. ${HINDU_LINK}`));
   }, { draft: 'Title\n\nPost body without marker.' });
 
   await caseRun('Google News unreachable: still drafts', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
