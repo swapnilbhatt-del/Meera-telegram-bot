@@ -144,6 +144,7 @@ await caseRun('TEST A: substantive note', TEST_A, ['{"score": 8, "reason": "The 
   // Live runs may send the draft request twice when the main model is busy and the backup answers.
   check('drafting step called', r.draftCalls.length >= 1 && (MOCK ? r.draftCalls.length === 1 : true));
   check('draft sent to Telegram', r.telegram.length === 1 && !r.telegram[0].startsWith("I didn't create"));
+  check('score shown at the end of the draft', score !== null && r.telegram.at(-1)?.includes(`\n\n———\nNote score: ${score}/10\n`));
 });
 
 await caseRun('TEST B: task/reminder', TEST_B, ['{"score": 2, "reason": "The note is a reminder to write about a topic and contains no actual idea or content."}'], (r, score) => {
@@ -210,7 +211,7 @@ if (MOCK) {
   const OUT_OF_QUOTA = { status: 429 };
   await caseRun('Main model busy (503): backup model answers', TEST_A, [OVERLOADED, '{"score": 8, "reason": "Specific."}'], (r, score) => {
     check('switched from main to backup model', r.scoreModels.join(',') === 'gemini-3.5-flash,gemini-3.5-flash-lite', r.scoreModels.join(' -> '));
-    check('scored and drafted', score === 8 && r.draftCalls.length === 1 && r.telegram[0] === 'MOCK DRAFT');
+    check('scored and drafted', score === 8 && r.draftCalls.length === 1 && r.telegram[0].startsWith('MOCK DRAFT'));
   });
 
   await caseRun('Main model out of quota (429): backup model answers', TEST_A, [OUT_OF_QUOTA, '{"score": 7, "reason": "Specific."}'], (r, score) => {
@@ -241,6 +242,15 @@ if (MOCK) {
   });
   if (savedModel === undefined) delete process.env.GEMINI_FALLBACK_MODEL;
   else process.env.GEMINI_FALLBACK_MODEL = savedModel;
+
+  await caseRun('Score footer: exact format at the end of the draft', TEST_A, ['{"score": 7, "reason": "Specific and draftable."}'], (r) => {
+    check('draft then score footer', r.telegram[0] === 'MOCK DRAFT\n\n———\nNote score: 7/10\nSpecific and draftable.', JSON.stringify(r.telegram[0]));
+    check('score not sent to Gemini for drafting', !r.draftCalls[0].contents[0].parts[0].text.includes('Note score'));
+  });
+
+  await caseRun('Rejected notes get no score footer', TEST_A, ['{"score": 4, "reason": "Too thin."}'], (r) => {
+    check('rejection message unchanged', r.telegram[0] === `${REJECT_PREFIX}Too thin.`);
+  });
 
   await caseRun('Drafting request is exactly the note', TEST_A, ['{"score": 9, "reason": "Strong."}'], (r) => {
     const body = r.draftCalls[0];

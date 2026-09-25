@@ -70,7 +70,12 @@ async function handleMessage(chatId, message) {
   }
 
   const draft = await draftPost(text);
-  await sendMessage(chatId, draft);
+  await sendMessage(chatId, `${draft}\n\n${scoreFooter(verdict)}`);
+}
+
+// Appended to every draft so Meera can see how strong the note was.
+export function scoreFooter({ score, reason }) {
+  return `———\nNote score: ${score}/10\n${reason}`;
 }
 
 function ok() {
