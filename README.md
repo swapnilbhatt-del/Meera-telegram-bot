@@ -15,7 +15,7 @@ No dependencies: it uses Node's built-in `fetch` for both the Telegram and Gemin
 
 | File | What it does |
 | --- | --- |
-| `api/telegram.js` | The webhook Telegram calls for every message. Checks the request is from Telegram, scores the note, and if it scores 6 or more looks up related Google News, drafts, and replies with the post, the score, and the news sources used. |
+| `api/telegram.js` | The webhook Telegram calls for every message. Checks the request is from Telegram, scores the note, and if it scores 6 or more looks up related Google News, drafts, and replies with a bold headline, the post, the score, and linked Google News sources. |
 | `api/setup.js` | Open once in a browser to connect Telegram to the deployment. |
 | `lib/gemini.js` | Sends the note to Gemini with `prompts/voice-skill.txt` as the system instruction. |
 | `lib/news.js` | Fetches the latest Google News RSS headlines (last 30 days, India by default) for the note's keywords. No key needed. |

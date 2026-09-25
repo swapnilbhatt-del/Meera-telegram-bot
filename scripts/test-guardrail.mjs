@@ -40,13 +40,18 @@ let cannedScores = []; // mock mode: raw scoring replies, consumed in order
 let cannedKeywords; // mock mode: raw keyword reply (default below)
 let feeds; // mock mode: RSS bodies (or Error) per news request, in order
 let cannedDraft; // mock mode: raw draft reply
+let rejectHtml = false; // mock mode: Telegram refuses HTML formatting
 
 globalThis.fetch = async (url, init = {}) => {
   const u = String(url);
   if (u.startsWith('https://api.telegram.org')) {
     const method = u.split('/').pop();
     const body = JSON.parse(init.body);
-    if (method === 'sendMessage') log.telegram.push(body.text);
+    if (method === 'sendMessage') {
+      if (body.parse_mode === 'HTML' && rejectHtml) return json({ ok: false, description: "Bad Request: can't parse entities" });
+      log.telegram.push(body.text);
+      log.parseModes.push(body.parse_mode ?? 'plain');
+    }
     return json({ ok: true, result: true });
   }
   if (u.startsWith('https://news.google.com/rss/search')) {
@@ -98,7 +103,7 @@ const { POST } = await import('../api/telegram.js');
 const { webhookSecret } = await import('../lib/telegram.js');
 
 async function run(note) {
-  log = { telegram: [], draftCalls: [], scoreCalls: 0, scoreModels: [], rawScores: [], keywordCalls: 0, newsQueries: [] };
+  log = { telegram: [], parseModes: [], draftCalls: [], scoreCalls: 0, scoreModels: [], rawScores: [], keywordCalls: 0, newsQueries: [] };
   const req = new Request('https://example.test/api/telegram', {
     method: 'POST',
     headers: { 'x-telegram-bot-api-secret-token': webhookSecret(), 'Content-Type': 'application/json' },
@@ -130,7 +135,8 @@ async function caseRun(title, note, canned, expect, mock = {}) {
   cannedScores = canned ?? [];
   cannedKeywords = mock.keywords ?? '{"keywords": ["niacinamide", "pH", "batch consistency", "CoA"], "query": "niacinamide pH"}';
   feeds = [...(mock.feeds ?? [SAMPLE_FEED])];
-  cannedDraft = mock.draft ?? 'MOCK DRAFT\nUSED: 1';
+  cannedDraft = mock.draft ?? 'Mock headline\n\nMOCK DRAFT\nUSED: 1';
+  rejectHtml = mock.rejectHtml ?? false;
   lastScoreLine = null;
   const r = await run(note);
   const score = lastScoreLine ? Number(lastScoreLine.match(/Note scored (\d+)/)[1]) : null;
@@ -153,7 +159,10 @@ await caseRun('TEST A: substantive note', TEST_A, ['{"score": 8, "reason": "The 
   check('Google News searched', r.newsQueries.length >= 1);
   check('headlines passed to drafting', r.draftCalls[0]?.contents[0].parts[0].text.includes(NEWS_MARKER));
   const reply = r.telegram.join('');
-  check('sources listed after the score', /Note score: [\s\S]*\n\nSources/.test(reply) || /Note score: [\s\S]*\n\nGoogle News headlines given/.test(reply));
+  check('starts with a bold headline', /^<b>[^<\n]{3,150}<\/b>\n\n\S/.test(reply), reply.split('\n')[0].slice(0, 90));
+  check('sent with HTML formatting', r.parseModes.every((m) => m === 'HTML'));
+  check('sources listed after the score', /Note score: [\s\S]*\n\n(Sources used from Google News:|Related Google News|Google News headlines given)/.test(reply));
+  check('reply has a Google News link', reply.includes('<a href="https://news.google.com/'));
   check('no USED: marker left in the post', !/^USED:/im.test(reply));
 });
 
@@ -221,7 +230,7 @@ if (MOCK) {
   const OUT_OF_QUOTA = { status: 429 };
   await caseRun('Main model busy (503): backup model answers', TEST_A, [OVERLOADED, '{"score": 8, "reason": "Specific."}'], (r, score) => {
     check('switched from main to backup model', r.scoreModels.join(',') === 'gemini-3.5-flash,gemini-3.5-flash-lite', r.scoreModels.join(' -> '));
-    check('scored and drafted', score === 8 && r.draftCalls.length === 1 && r.telegram[0].startsWith('MOCK DRAFT'));
+    check('scored and drafted', score === 8 && r.draftCalls.length === 1 && r.telegram[0].includes('MOCK DRAFT'));
   });
 
   await caseRun('Main model out of quota (429): backup model answers', TEST_A, [OUT_OF_QUOTA, '{"score": 7, "reason": "Specific."}'], (r, score) => {
@@ -253,70 +262,119 @@ if (MOCK) {
   if (savedModel === undefined) delete process.env.GEMINI_FALLBACK_MODEL;
   else process.env.GEMINI_FALLBACK_MODEL = savedModel;
 
-  await caseRun('Reply format: post, score footer, sources', TEST_A, ['{"score": 7, "reason": "Specific and draftable."}'], (r) => {
-    check('post, score, then sources', r.telegram[0] === 'MOCK DRAFT\n\n———\nNote score: 7/10\nSpecific and draftable.\n\nSources used from Google News:\n1. CDSCO tightens cosmetic labelling & testing rules (Economic Times, 2026-09-23)\nhttps://news.google.com/rss/articles/BBB', JSON.stringify(r.telegram[0]));
+  const CDSCO_LINK = '<a href="https://news.google.com/rss/articles/BBB">CDSCO tightens cosmetic labelling &amp; testing rules</a> (Economic Times, 2026-09-23)';
+  const HINDU_LINK = `<a href="https://news.google.com/rss/articles/AAA">Why your niacinamide serum's pH matters more than its percentage</a> (The Hindu, 2026-09-21)`;
+
+  await caseRun('Reply format: bold headline, post, score, linked sources', TEST_A, ['{"score": 7, "reason": "Specific and draftable."}'], (r) => {
+    check('exact reply', r.telegram[0] === `<b>Mock headline</b>\n\nMOCK DRAFT\n\n———\nNote score: 7/10\nSpecific and draftable.\n\nSources used from Google News:\n1. ${CDSCO_LINK}`, JSON.stringify(r.telegram[0]));
+    check('sent as HTML', r.parseModes[0] === 'HTML');
     check('score not sent to Gemini for drafting', !r.draftCalls[0].contents[0].parts[0].text.includes('Note score'));
   });
 
-  await caseRun('Rejected notes get no score footer', TEST_A, ['{"score": 4, "reason": "Too thin."}'], (r) => {
+  await caseRun('Rejected notes get no score footer (plain text)', TEST_A, ['{"score": 4, "reason": "Too thin."}'], (r) => {
     check('rejection message unchanged', r.telegram[0] === `${REJECT_PREFIX}Too thin.`);
+    check('sent as plain text', r.parseModes[0] === 'plain');
   });
 
-  await caseRun('No news found: drafting request is exactly the note', TEST_A, ['{"score": 9, "reason": "Strong."}'], (r) => {
+  await caseRun('Headline with markdown is cleaned', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
+    check('asterisks removed, bolded properly', r.telegram[0].startsWith('<b>Why 5% beats 10%</b>\n\nBody.'), r.telegram[0].slice(0, 60));
+  }, { draft: '**Why 5% beats 10%**\n\nBody.\nUSED: 1' });
+
+  await caseRun('Headline with "#" and "Headline:" prefix is cleaned', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
+    check('prefixes removed', r.telegram[0].startsWith('<b>The label is only the start</b>\n\n'), r.telegram[0].slice(0, 60));
+  }, { draft: '# Headline: The label is only the start\n\nBody.\nUSED: 1' });
+
+  await caseRun('No headline from Gemini: post sent without bold line', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
+    check('no <b> tag, post intact', !r.telegram[0].includes('<b>') && r.telegram[0].startsWith('One paragraph only.\n\n———'));
+  }, { draft: 'One paragraph only.\nUSED: 1' });
+
+  await caseRun('Special characters in the draft are escaped', TEST_A, ['{"score": 8, "reason": "pH < 4 & stable."}'], (r) => {
+    const reply = r.telegram[0];
+    check('headline escaped', reply.startsWith('<b>pH &lt; 3.8 &amp; why</b>'));
+    check('body escaped', reply.includes('Use <b> tags? No: &lt;script&gt;'.replace('<b>', '&lt;b&gt;')));
+    check('reason escaped', reply.includes('pH &lt; 4 &amp; stable.'));
+  }, { draft: 'pH < 3.8 & why\n\nUse <b> tags? No: <script>\nUSED: 1' });
+
+  await caseRun('Telegram rejects HTML: resent as plain text with links kept', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
+    const reply = r.telegram[0] ?? '';
+    check('plain text fallback sent', r.parseModes[0] === 'plain');
+    check('no tags or entities left', !/<\/?[ab]|&amp;/.test(reply), reply.slice(0, 80));
+    check('link URL kept', reply.includes('CDSCO tightens cosmetic labelling & testing rules (https://news.google.com/rss/articles/BBB)'));
+  }, { rejectHtml: true });
+
+  await caseRun('No news anywhere: widened search 4 times, then drafted without news', TEST_A, ['{"score": 9, "reason": "Strong."}'], (r) => {
     const body = r.draftCalls[0];
-    check('tried query, then keyword fallback', r.newsQueries.length === 2 && r.newsQueries[1].startsWith('niacinamide OR pH'), JSON.stringify(r.newsQueries));
+    check('4 searches, narrowest first', JSON.stringify(r.newsQueries) === JSON.stringify(['niacinamide pH when:30d', 'niacinamide OR pH when:30d', 'niacinamide when:30d', 'niacinamide OR pH when:1y']), JSON.stringify(r.newsQueries));
     check('only systemInstruction + contents keys (no generationConfig)', body && Object.keys(body).join(',') === 'systemInstruction,contents');
     check('note passed through verbatim', body?.contents[0].parts[0].text === TEST_A);
     check('reply says no news found', r.telegram[0].endsWith('\n\nSources: none (no related Google News found)'));
-  }, { feeds: [EMPTY_FEED, EMPTY_FEED], draft: 'MOCK DRAFT' });
+  }, { feeds: [EMPTY_FEED, EMPTY_FEED, EMPTY_FEED, EMPTY_FEED] });
 
-  await caseRun('Fallback query finds news', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
-    check('headlines passed to drafting', r.draftCalls[0]?.contents[0].parts[0].text.includes(NEWS_MARKER));
-    check('source listed', r.telegram[0].includes('Sources used from Google News:\n1. CDSCO'));
+  await caseRun('Second search (either keyword) finds news', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
+    check('stopped after 2 searches', r.newsQueries.length === 2);
+    check('source linked', r.telegram[0].includes(`Sources used from Google News:\n1. ${CDSCO_LINK}`));
   }, { feeds: [EMPTY_FEED, SAMPLE_FEED] });
 
-  await caseRun('Headlines in the draft request have no links (Gemini cannot paste them)', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
+  await caseRun('Third search (single keyword) finds news', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
+    check('stopped after 3 searches', r.newsQueries.length === 3 && r.newsQueries[2] === 'niacinamide when:30d', JSON.stringify(r.newsQueries));
+    check('headlines passed to drafting', r.draftCalls[0]?.contents[0].parts[0].text.includes(NEWS_MARKER));
+  }, { feeds: [EMPTY_FEED, EMPTY_FEED, SAMPLE_FEED] });
+
+  await caseRun('Fourth search (last year) finds news', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
+    check('used 1-year window', r.newsQueries.at(-1) === 'niacinamide OR pH when:1y');
+    check('reply has a Google News link', r.telegram[0].includes('<a href="https://news.google.com/'));
+  }, { feeds: [EMPTY_FEED, EMPTY_FEED, EMPTY_FEED, SAMPLE_FEED] });
+
+  await caseRun('Only one keyword: duplicate searches skipped', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
+    check('2 distinct searches', JSON.stringify(r.newsQueries) === JSON.stringify(['niacinamide when:30d', 'niacinamide when:1y']), JSON.stringify(r.newsQueries));
+  }, { keywords: '{"keywords": ["niacinamide"], "query": "niacinamide"}', feeds: [EMPTY_FEED, EMPTY_FEED] });
+
+  await caseRun('Draft request requires at least one headline, without links', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
     const req = r.draftCalls[0]?.contents[0].parts[0].text ?? '';
+    check('asks to use at least one headline', req.includes('at least one headline'));
+    check('no "USED: none" option offered', !req.includes('USED: none'));
     check('no URLs sent to Gemini', !req.includes('https://'));
     check('asks for USED line', req.includes('"USED: 1, 3"'));
+    check('asks for a headline first line', r.draftCalls[0]?.systemInstruction.parts[0].text.includes('First line: a headline'));
   });
 
   await caseRun('Gemini used headline 2 only', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
     const reply = r.telegram[0];
-    check('only headline 2 listed', reply.includes("1. Why your niacinamide serum's pH matters more than its percentage (The Hindu, 2026-09-21)\nhttps://news.google.com/rss/articles/AAA") && !reply.includes('CDSCO'));
-    check('USED line removed from post', reply.startsWith('Post body.\n\n———'));
-  }, { draft: 'Post body.\nUSED: 2' });
+    check('only headline 2 listed, linked', reply.includes(`1. ${HINDU_LINK}`) && !reply.includes('CDSCO'));
+    check('USED line removed from post', reply.startsWith('<b>Title</b>\n\nPost body.\n\n———'));
+  }, { draft: 'Title\n\nPost body.\nUSED: 2' });
 
   await caseRun('Gemini used both headlines (bold marker, repeats)', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
     const reply = r.telegram[0];
-    check('both listed once each', (reply.match(/\n\d\. /g) || []).length === 2);
+    check('both listed once each', (reply.match(/\n\d\. <a href/g) || []).length === 2);
     check('marker removed', !reply.includes('USED'));
-  }, { draft: 'Post body.\n**USED: 1, 2, 2**' });
+  }, { draft: 'Title\n\nPost body.\n**USED: 1, 2, 2**' });
 
-  await caseRun('Gemini used none of the headlines', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
-    check('says headlines not used', r.telegram[0].endsWith('\n\nSources: none (the related Google News headlines were not used)'));
-    check('marker removed', !r.telegram[0].includes('USED'));
-  }, { draft: 'Post body.\nUSED: none' });
+  await caseRun('Gemini used none anyway: related news still linked', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
+    const reply = r.telegram[0];
+    check('related news listed with links', reply.includes(`Related Google News (not used in the post):\n1. ${CDSCO_LINK}\n2. ${HINDU_LINK}`));
+    check('marker removed', !reply.includes('USED'));
+  }, { draft: 'Title\n\nPost body.\nUSED: none' });
 
   await caseRun('Gemini cited a headline number that does not exist', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
-    check('invalid number ignored, valid kept', r.telegram[0].includes('1. CDSCO') && !r.telegram[0].includes('Hindu'));
-  }, { draft: 'Post body.\nUSED: 9, 1' });
+    check('invalid number ignored, valid kept', r.telegram[0].includes(`1. ${CDSCO_LINK}`) && !r.telegram[0].includes('Hindu'));
+  }, { draft: 'Title\n\nPost body.\nUSED: 9, 1' });
 
   await caseRun('Gemini forgot the USED line', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
     const reply = r.telegram[0];
-    check('post kept whole', reply.startsWith('Post body without marker.\n\n———'));
-    check('all headlines listed with a check-them warning', reply.includes("didn't say which it used") && reply.includes('CDSCO') && reply.includes('Hindu'));
-  }, { draft: 'Post body without marker.' });
+    check('post kept whole', reply.startsWith('<b>Title</b>\n\nPost body without marker.\n\n———'));
+    check('all headlines linked with a check-them warning', reply.includes("didn't say which it used") && reply.includes(CDSCO_LINK) && reply.includes(HINDU_LINK));
+  }, { draft: 'Title\n\nPost body without marker.' });
 
   await caseRun('Google News unreachable: still drafts', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
     check('draft made without news', r.draftCalls.length === 1 && r.draftCalls[0].contents[0].parts[0].text === TEST_A);
-    check('draft sent with no-news sources line', r.telegram[0].startsWith('MOCK DRAFT') && r.telegram[0].endsWith('Sources: none (no related Google News found)'));
-  }, { feeds: [new Error('network down'), new Error('network down')], draft: 'MOCK DRAFT' });
+    check('draft sent with no-news sources line', r.telegram[0].includes('MOCK DRAFT') && r.telegram[0].endsWith('Sources: none (no related Google News found)'));
+  }, { feeds: [new Error('network down'), new Error('network down'), new Error('network down'), new Error('network down')] });
 
   await caseRun('Keyword reply malformed: still drafts', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
     check('no news search', r.newsQueries.length === 0);
     check('draft made without news', r.draftCalls.length === 1 && r.draftCalls[0].contents[0].parts[0].text === TEST_A);
-  }, { keywords: 'not json', draft: 'MOCK DRAFT' });
+  }, { keywords: 'not json' });
 
   realLog('\nRSS parser');
   const { parseFeed } = await import('../lib/news.js');

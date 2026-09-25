@@ -1,6 +1,6 @@
 import { draftPost, scoreNote, extractKeywords, MIN_DRAFT_SCORE } from '../lib/gemini.js';
 import { searchNews } from '../lib/news.js';
-import { sendMessage, sendTyping, webhookSecret } from '../lib/telegram.js';
+import { sendMessage, sendTyping, webhookSecret, escapeHtml } from '../lib/telegram.js';
 
 // Telegram webhook: POST /api/telegram
 export async function POST(request) {
@@ -72,18 +72,46 @@ async function handleMessage(chatId, message) {
 
   const news = await findNews(text);
   const draft = await draftPost(text, news);
-  await sendMessage(chatId, `${draft.post}\n\n${scoreFooter(verdict)}\n\n${sourcesFooter(draft, news.length)}`);
+  await sendMessage(chatId, formatReply(draft, verdict, news), { html: true });
+}
+
+// Bold headline, post, score, then Google News sources. Everything from Gemini is escaped.
+export function formatReply(draft, verdict, news) {
+  return [
+    draft.headline && `<b>${escapeHtml(draft.headline)}</b>`,
+    escapeHtml(draft.post),
+    escapeHtml(scoreFooter(verdict)),
+    sourcesFooter(draft, news),
+  ]
+    .filter(Boolean)
+    .join('\n\n');
 }
 
 // Note keywords -> Google News RSS. Best effort: any failure means drafting without news.
 async function findNews(note) {
   const extracted = await extractKeywords(note);
   if (!extracted) return [];
-  let news = await searchNews(extracted.query);
-  // A multi-word query can be too narrow; fall back to the two most specific keywords.
-  if (!news.length) news = await searchNews(extracted.keywords.slice(0, 2).join(' OR '));
-  console.log(`News for [${extracted.keywords.join(', ')}] via "${extracted.query}": ${news.length} headline(s)`);
-  return news;
+  const [first, second] = extracted.keywords;
+  const either = [first, second].filter(Boolean).join(' OR ');
+  // Narrowest first, widening until something turns up, so almost every draft has a news link.
+  const attempts = [
+    [extracted.query, '30d'],
+    [either, '30d'],
+    [first, '30d'],
+    [either, '1y'],
+  ];
+  const tried = new Set();
+  for (const [query, window] of attempts) {
+    if (tried.has(`${query}|${window}`)) continue;
+    tried.add(`${query}|${window}`);
+    const news = await searchNews(query, window);
+    if (news.length) {
+      console.log(`News for [${extracted.keywords.join(', ')}] via "${query}" (${window}): ${news.length} headline(s)`);
+      return news;
+    }
+  }
+  console.log(`News for [${extracted.keywords.join(', ')}]: nothing found`);
+  return [];
 }
 
 // Appended to every draft so Meera can see how strong the note was.
@@ -92,16 +120,22 @@ export function scoreFooter({ score, reason }) {
 }
 
 // Listed after the score so Meera can check anything the draft took from Google News.
-export function sourcesFooter({ sources, confirmed }, newsCount) {
-  if (!newsCount) return 'Sources: none (no related Google News found)';
-  if (confirmed && !sources.length) return 'Sources: none (the related Google News headlines were not used)';
-  const heading = confirmed
-    ? 'Sources used from Google News:'
-    : "Google News headlines given to the draft (it didn't say which it used, so check all of them):";
-  const list = sources.map(
-    (n, i) => `${i + 1}. ${n.title} (${[n.source, n.published].filter(Boolean).join(', ') || 'unknown source'})\n${n.link}`,
-  );
-  return [heading, ...list].join('\n');
+// Returns HTML: each headline links to its Google News article.
+export function sourcesFooter({ sources, confirmed }, news) {
+  if (!news.length) return 'Sources: none (no related Google News found)';
+  let heading = 'Sources used from Google News:';
+  let list = sources;
+  if (!confirmed) {
+    heading = "Google News headlines given to the draft (it didn't say which it used, so check all of them):";
+  } else if (!sources.length) {
+    heading = 'Related Google News (not used in the post):';
+    list = news;
+  }
+  const items = list.map((n, i) => {
+    const meta = [n.source, n.published].filter(Boolean).join(', ') || 'unknown source';
+    return `${i + 1}. <a href="${escapeHtml(n.link)}">${escapeHtml(n.title)}</a> (${escapeHtml(meta)})`;
+  });
+  return [heading, ...items].join('\n');
 }
 
 function ok() {
