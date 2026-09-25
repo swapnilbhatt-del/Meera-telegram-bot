@@ -64,7 +64,10 @@ globalThis.fetch = async (url, init = {}) => {
     }
     const isDraft = sys.startsWith(DRAFT_MARKER);
     if (isDraft) log.draftCalls.push(body);
-    else log.scoreCalls++;
+    else {
+      log.scoreCalls++;
+      log.scoreModels.push(u.match(/models\/([^:]+):/)[1]);
+    }
     if (!MOCK) {
       const res = await realFetch(url, init);
       if (!isDraft) {
@@ -93,7 +96,7 @@ const { POST } = await import('../api/telegram.js');
 const { webhookSecret } = await import('../lib/telegram.js');
 
 async function run(note) {
-  log = { telegram: [], draftCalls: [], scoreCalls: 0, rawScores: [], keywordCalls: 0, newsQueries: [] };
+  log = { telegram: [], draftCalls: [], scoreCalls: 0, scoreModels: [], rawScores: [], keywordCalls: 0, newsQueries: [] };
   const req = new Request('https://example.test/api/telegram', {
     method: 'POST',
     headers: { 'x-telegram-bot-api-secret-token': webhookSecret(), 'Content-Type': 'application/json' },
@@ -138,7 +141,8 @@ async function caseRun(title, note, canned, expect, mock = {}) {
 
 await caseRun('TEST A: substantive note', TEST_A, ['{"score": 8, "reason": "The note makes a specific argument about why label concentration is incomplete, naming pH, delivery base and batch consistency."}'], (r, score) => {
   check('score >= 6', score !== null && score >= 6, `score=${score}`);
-  check('drafting step called once', r.draftCalls.length === 1);
+  // Live runs may send the draft request twice when the main model is busy and the backup answers.
+  check('drafting step called', r.draftCalls.length >= 1 && (MOCK ? r.draftCalls.length === 1 : true));
   check('draft sent to Telegram', r.telegram.length === 1 && !r.telegram[0].startsWith("I didn't create"));
 });
 
@@ -203,16 +207,40 @@ if (MOCK) {
   });
 
   const OVERLOADED = { status: 503 };
-  await caseRun('Gemini overloaded (503) once, then answers', TEST_A, [OVERLOADED, '{"score": 8, "reason": "Specific."}'], (r, score) => {
-    check('retried after 503 and scored', r.scoreCalls === 2 && score === 8);
-    check('draft sent', r.draftCalls.length === 1 && r.telegram[0] === 'MOCK DRAFT');
+  const OUT_OF_QUOTA = { status: 429 };
+  await caseRun('Main model busy (503): backup model answers', TEST_A, [OVERLOADED, '{"score": 8, "reason": "Specific."}'], (r, score) => {
+    check('switched from main to backup model', r.scoreModels.join(',') === 'gemini-3.5-flash,gemini-3.5-flash-lite', r.scoreModels.join(' -> '));
+    check('scored and drafted', score === 8 && r.draftCalls.length === 1 && r.telegram[0] === 'MOCK DRAFT');
   });
 
-  await caseRun('Gemini overloaded (503) on every try', TEST_A, [OVERLOADED, OVERLOADED, OVERLOADED], (r) => {
-    check('gave up after 3 tries', r.scoreCalls === 3);
+  await caseRun('Main model out of quota (429): backup model answers', TEST_A, [OUT_OF_QUOTA, '{"score": 7, "reason": "Specific."}'], (r, score) => {
+    check('switched to backup model', r.scoreModels[1] === 'gemini-3.5-flash-lite', r.scoreModels.join(' -> '));
+    check('scored and drafted', score === 7 && r.draftCalls.length === 1);
+  });
+
+  await caseRun('Both models busy at first, main recovers after a pause', TEST_A, [OVERLOADED, OVERLOADED, '{"score": 9, "reason": "Strong."}'], (r, score) => {
+    check('main, backup, then main again', r.scoreModels.join(',') === 'gemini-3.5-flash,gemini-3.5-flash-lite,gemini-3.5-flash', r.scoreModels.join(' -> '));
+    check('scored and drafted', score === 9 && r.draftCalls.length === 1);
+  });
+
+  await caseRun('Both models busy on every try', TEST_A, [OVERLOADED, OUT_OF_QUOTA, OVERLOADED, OVERLOADED], (r) => {
+    check('gave up after 4 tries (2 per model)', r.scoreCalls === 4, r.scoreModels.join(' -> '));
     check('drafting step NOT called', r.draftCalls.length === 0);
     check('existing error reply sent', r.telegram[0]?.startsWith('Sorry, something went wrong'));
   });
+
+  await caseRun('Non-retryable error (500) does not switch models', TEST_A, [new Error('internal')], (r) => {
+    check('only one attempt', r.scoreCalls === 1);
+    check('existing error reply sent', r.telegram[0]?.startsWith('Sorry, something went wrong'));
+  });
+
+  const savedModel = process.env.GEMINI_FALLBACK_MODEL;
+  process.env.GEMINI_FALLBACK_MODEL = 'custom-backup';
+  await caseRun('GEMINI_FALLBACK_MODEL setting is respected', TEST_A, [OVERLOADED, '{"score": 8, "reason": "Specific."}'], (r) => {
+    check('uses the configured backup', r.scoreModels[1] === 'custom-backup', r.scoreModels.join(' -> '));
+  });
+  if (savedModel === undefined) delete process.env.GEMINI_FALLBACK_MODEL;
+  else process.env.GEMINI_FALLBACK_MODEL = savedModel;
 
   await caseRun('Drafting request is exactly the note', TEST_A, ['{"score": 9, "reason": "Strong."}'], (r) => {
     const body = r.draftCalls[0];
