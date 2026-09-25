@@ -164,6 +164,11 @@ await caseRun('TEST A: substantive note', TEST_A, ['{"score": 8, "reason": "The 
   check('sources listed after the score', /Note score: [\s\S]*\n\n(Sources used from Google News:|Related Google News|Google News headlines given)/.test(reply));
   check('reply has a Google News link', reply.includes('<a href="https://news.google.com/'));
   check('no USED: marker left in the post', !/^USED:/im.test(reply));
+  const post = reply.split('———')[0];
+  const allowed = (r.draftCalls.at(-1)?.contents[0].parts[0].text ?? '') + TEST_A;
+  check('no "not selling" line about her own product', !/not selling (a |an |our )?(serum|niacinamide)/i.test(post));
+  const invented = (post.match(/\d+(?:\.\d+)?\s?%/g) || []).filter((p) => !allowed.includes(p.replace(/\s/, '')));
+  check('no percentages beyond the note and headlines', invented.length === 0, invented.join(', ') || 'none invented');
 });
 
 await caseRun('TEST B: task/reminder', TEST_B, ['{"score": 2, "reason": "The note is a reminder to write about a topic and contains no actual idea or content."}'], (r, score) => {
@@ -329,10 +334,13 @@ if (MOCK) {
     check('2 distinct searches', JSON.stringify(r.newsQueries) === JSON.stringify(['niacinamide when:30d', 'niacinamide when:1y']), JSON.stringify(r.newsQueries));
   }, { keywords: '{"keywords": ["niacinamide"], "query": "niacinamide"}', feeds: [EMPTY_FEED, EMPTY_FEED] });
 
-  await caseRun('Draft request requires at least one headline, without links', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
+  await caseRun('Draft request: headlines only if relevant, no invented facts, no links', TEST_A, ['{"score": 8, "reason": "Specific."}'], (r) => {
     const req = r.draftCalls[0]?.contents[0].parts[0].text ?? '';
-    check('asks to use at least one headline', req.includes('at least one headline'));
-    check('no "USED: none" option offered', !req.includes('USED: none'));
+    const sys = r.draftCalls[0]?.systemInstruction.parts[0].text ?? '';
+    check('headlines used only if relevant', req.includes('only if it is directly about') && req.includes('Do not force a connection'));
+    check('"USED: none" allowed', req.includes('"USED: none"'));
+    check('no-invented-facts rule', sys.includes('Never invent numbers') && sys.includes('[add figure]'));
+    check('voice examples are not facts', sys.includes('its examples are not facts'));
     check('no URLs sent to Gemini', !req.includes('https://'));
     check('asks for USED line', req.includes('"USED: 1, 3"'));
     check('asks for a headline first line', r.draftCalls[0]?.systemInstruction.parts[0].text.includes('First line: a headline'));
